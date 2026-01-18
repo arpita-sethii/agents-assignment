@@ -40,6 +40,7 @@ from ..tokenize.basic import split_words
 from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
 from ..utils.misc import is_given
 from ._utils import _set_participant_attributes
+from .interrupt_config import is_backchannel_only
 from .agent import (
     Agent,
     ModelSettings,
@@ -135,6 +136,8 @@ class AgentActivity(RecognitionHooks):
         self._speech_tasks: list[asyncio.Task[Any]] = []
 
         self._preemptive_generation: _PreemptiveGeneration | None = None
+
+        self._last_transcript_was_backchannel = False
 
         self._drain_blocked_tasks: list[asyncio.Task[Any]] = []
         self._mcp_tools: list[mcp.MCPTool] = []
@@ -1174,6 +1177,12 @@ class AgentActivity(RecognitionHooks):
             # ignore if realtime model has turn detection enabled
             return
 
+        # Get current transcript first
+        text = ""
+        if self._audio_recognition is not None:
+            text = self._audio_recognition.current_transcript
+
+
         if (
             self.stt is not None
             and opt.min_interruption_words > 0
@@ -1185,12 +1194,12 @@ class AgentActivity(RecognitionHooks):
             if len(split_words(text, split_character=True)) < opt.min_interruption_words:
                 return
 
+
         if self._rt_session is not None:
             self._rt_session.start_user_activity()
 
         if (
             self._current_speech is not None
-            and not self._current_speech.interrupted
             and self._current_speech.allow_interruptions
         ):
             self._paused_speech = self._current_speech
@@ -1257,6 +1266,63 @@ class AgentActivity(RecognitionHooks):
             ),
         )
 
+        transcript_text = ev.alternatives[0].text
+        
+        logger.debug(f"Interim transcript check - paused_speech: {self._paused_speech is not None}, text: {ev.alternatives[0].text}")
+        # Check for backchannel during interim transcript
+        if (
+            transcript_text 
+            and is_backchannel_only(transcript_text)
+            and (self._paused_speech or self._session._agent_state == "speaking")
+            and self._session.options.resume_false_interruption
+            and self._session.output.audio
+            and self._session.output.audio.can_pause
+        ):
+            # This is a backchannel - resume immediately
+            logger.debug(
+                "Backchannel detected, resuming agent speech",
+                extra={"transcript": transcript_text}
+            )
+            self._session.output.audio.resume()
+            self._session._update_agent_state("speaking")
+            
+            if self._false_interruption_timer:
+                self._false_interruption_timer.cancel()
+                self._false_interruption_timer = None
+                
+            self._paused_speech = None
+            self._last_transcript_was_backchannel = True
+            logger.debug(f"Set backchannel flag to True")
+            return
+
+        transcript_text = ev.alternatives[0].text
+        
+        logger.debug(f"Interim transcript check - paused_speech: {self._paused_speech is not None}, text: {ev.alternatives[0].text}")
+        # Check for backchannel during interim transcript
+        if (
+            transcript_text 
+            and is_backchannel_only(transcript_text)
+            and (self._paused_speech or self._session._agent_state == "speaking")
+            and self._session.options.resume_false_interruption
+            and self._session.output.audio
+            and self._session.output.audio.can_pause
+        ):
+            # This is a backchannel - resume immediately (false interruption)
+            logger.debug(
+                "Backchannel detected, resuming agent speech",
+                extra={"transcript": transcript_text}
+            )
+            self._session.output.audio.resume()
+            self._session._update_agent_state("speaking")
+            
+            # Cancel the false interruption timer since we're handling it now
+            if self._false_interruption_timer:
+                self._false_interruption_timer.cancel()
+                self._false_interruption_timer = None
+                
+            self._paused_speech = None
+            return
+
         if ev.alternatives[0].text and self._turn_detection not in (
             "manual",
             "realtime_llm",
@@ -1284,6 +1350,20 @@ class AgentActivity(RecognitionHooks):
                 speaker_id=ev.alternatives[0].speaker_id,
             ),
         )
+
+        transcript_text = ev.alternatives[0].text
+        
+        # Skip processing if this was a backchannel that was already resumed
+        if (
+            transcript_text
+            and is_backchannel_only(transcript_text)
+            and self._last_transcript_was_backchannel
+        ):
+            logger.debug(
+                "Skipping backchannel from turn processing",
+                extra={"transcript": transcript_text}
+            )
+            return
         # agent speech might not be interrupted if VAD failed and a final transcript is received
         # we call _interrupt_by_audio_activity (idempotent) to pause the speech, if possible
         # which will also be immediately interrupted
@@ -1378,6 +1458,24 @@ class AgentActivity(RecognitionHooks):
             self._cancel_preemptive_generation()
             # avoid interruption if the new_transcript is too short
             return False
+
+        logger.debug(f"End-of-turn check - transcript: {info.new_transcript}, is_backchannel: {is_backchannel_only(info.new_transcript) if info.new_transcript else False}, flag: {self._last_transcript_was_backchannel}")
+        # Check if this is a backchannel that was already handled
+        if (
+            info.new_transcript
+            and is_backchannel_only(info.new_transcript)
+            and self._last_transcript_was_backchannel
+        ):
+            logger.debug(
+                "Skipping backchannel from end-of-turn processing",
+                extra={"transcript": info.new_transcript}
+            )
+            self._last_transcript_was_backchannel = False
+            return False
+        
+        # Reset backchannel flag for non-backchannel turns
+        self._last_transcript_was_backchannel = False
+
 
         old_task = self._user_turn_completed_atask
         self._user_turn_completed_atask = self._create_speech_task(
